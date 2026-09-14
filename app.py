@@ -22,7 +22,7 @@ logger = logging.getLogger("spm_predictor")
 app = FastAPI(
     title="SPM Stream Predictor API",
     description="Recommends ART / SCIENCE / SEMI SCIENCE stream for a student based on Form 3 results.",
-    version="4.0.0",
+    version="5.0.0",
 )
 
 app.add_middleware(
@@ -37,11 +37,6 @@ app.add_middleware(
 # Constants
 # --------------------------------------------------
 F3_COLS = ["F3_BM", "F3_BI", "F3_Math", "F3_Science", "F3_Sejarah", "F3_Geo", "F3_RBT", "F3_PSV"]
-# maps API field name -> the short column name used inside the model bundle
-F3_TO_SHORT = {
-    "F3_BM": "BM", "F3_BI": "BI", "F3_Math": "Math", "F3_Science": "Science",
-    "F3_Sejarah": "Sejarah", "F3_Geo": "Geo", "F3_RBT": "RBT", "F3_PSV": "PSV",
-}
 SUBJECT_LABELS = {
     "F3_BM": "Bahasa Melayu",
     "F3_BI": "English",
@@ -53,8 +48,8 @@ SUBJECT_LABELS = {
     "F3_PSV": "PSV",
 }
 STREAMS = ["SCIENCE", "SEMI SCIENCE", "ART"]
-MODEL_PATH = "spm_merit_predictor_v2.pkl"
-SEMI_SCIENCE_BALANCE_BONUS_DEFAULT = 0.15
+MODEL_PATH = "spm_merit_predictor_by_stream.pkl"
+MERIT_MIN, MERIT_MAX = 0.0, 100.0  # sane display bounds; the Ridge models can extrapolate slightly outside 0-100
 
 # --------------------------------------------------
 # AI comment settings (Groq — fast inference, generous free tier)
@@ -74,33 +69,23 @@ FALLBACK_REASON = "This stream best matches your Form 3 results based on our pre
 # --------------------------------------------------
 # Load model bundle at startup (fail loudly if missing/corrupt)
 # --------------------------------------------------
-bundle: dict = {}
-merit_model = None
-feature_cols: list = []
-f3_short_cols: list = []
-gates: dict = {}
-pop_mean: dict = {}
-pop_std: dict = {}
-merit_min: float = 0.0
-merit_max: float = 100.0
-semi_science_balance_bonus: float = SEMI_SCIENCE_BALANCE_BONUS_DEFAULT
+# spm_merit_predictor_by_stream.pkl is a plain dict:
+#   { "ART": Pipeline(StandardScaler -> Ridge),
+#     "SCIENCE": Pipeline(StandardScaler -> Ridge),
+#     "SEMI SCIENCE": Pipeline(StandardScaler -> Ridge) }
+# Each pipeline takes the 8 F3_* columns directly and predicts that
+# stream's own merit score. There is no shared feature set, no gating
+# metadata, and no population stats bundled with this file.
+stream_models: Dict[str, object] = {}
 model_load_error: Optional[str] = None
 
 try:
     bundle = joblib.load(MODEL_PATH)
-    merit_model = bundle["merit_model"]
-    feature_cols = bundle["feature_cols"]
-    f3_short_cols = bundle["f3_cols"]
-    gates = bundle["gates"]
-    pop_mean = bundle["population_mean"]
-    pop_std = bundle["population_std"]
-    merit_min, merit_max = bundle["merit_clip_range"]
-    semi_science_balance_bonus = bundle.get("semi_science_balance_bonus", SEMI_SCIENCE_BALANCE_BONUS_DEFAULT)
-    logger.info(
-        "Loaded model bundle v2 | n_train=%s cv_mae=%.2f cv_r2=%.3f holdout_acc=%.3f",
-        bundle.get("n_train"), bundle.get("cv_mae", -1), bundle.get("cv_r2", -1),
-        bundle.get("holdout_recommendation_accuracy", -1),
-    )
+    missing = [s for s in STREAMS if s not in bundle]
+    if missing:
+        raise KeyError(f"Model bundle is missing stream model(s): {missing}")
+    stream_models = {s: bundle[s] for s in STREAMS}
+    logger.info("Loaded per-stream model bundle from %s | streams=%s", MODEL_PATH, list(stream_models.keys()))
 except Exception as e:
     model_load_error = str(e)
     logger.error("Failed to load %s: %s", MODEL_PATH, e)
@@ -135,61 +120,23 @@ class ScoreInput(BaseModel):
 
 
 # --------------------------------------------------
-# Core recommendation logic (gate -> subject-fit -> merit)
+# Core recommendation logic (simple: run each stream's own model,
+# pick the stream with the highest predicted merit score)
 # --------------------------------------------------
-def eligible_streams(short_scores: dict) -> list:
-    """A stream only qualifies if the student's Math+Science marks clear the
-    data-driven prerequisite bar for that stream. ART has no hard prerequisite."""
-    stem_total = short_scores["Math"] + short_scores["Science"]
-    eligible = ["ART"]
-    if stem_total >= gates["SEMI_SCIENCE_min_math_plus_science"]:
-        eligible.append("SEMI SCIENCE")
-    if stem_total >= gates["SCIENCE_min_math_plus_science"]:
-        eligible.append("SCIENCE")
-    return eligible
+def predict_merit_for_stream(scores: dict, stream: str) -> float:
+    x = pd.DataFrame([scores])[F3_COLS]
+    pred = float(stream_models[stream].predict(x)[0])
+    return round(float(np.clip(pred, MERIT_MIN, MERIT_MAX)), 2)
 
 
-def subject_fit(short_scores: dict) -> tuple:
-    """z-score the student's STEM marks and Humanities marks against the whole
-    training population — apples-to-apples, unaffected by each stream's
-    different merit baseline."""
-    z = {c: (short_scores[c] - pop_mean[c]) / pop_std[c] for c in f3_short_cols}
-    stem_z = float(np.mean([z["Math"], z["Science"]]))
-    hum_z = float(np.mean([z["BM"], z["Sejarah"], z["Geo"]]))
-    return stem_z, hum_z
-
-
-def predict_merit_for_stream(short_scores: dict, stream: str) -> float:
-    row = {**short_scores}
-    for s in STREAMS:
-        row[f"is_{s}"] = 1 if s == stream else 0
-    x = pd.DataFrame([row])[feature_cols]
-    pred = float(merit_model.predict(x)[0])
-    return round(float(np.clip(pred, merit_min, merit_max)), 2)
-
-
-def recommend(short_scores: dict) -> dict:
-    eligible = eligible_streams(short_scores)
-    stem_z, hum_z = subject_fit(short_scores)
-    fit_score = {
-        "SCIENCE": stem_z,
-        "ART": hum_z,
-        "SEMI SCIENCE": (stem_z + hum_z) / 2 + semi_science_balance_bonus,
-    }
-    best_stream = max(eligible, key=lambda s: fit_score[s])
-
-    # numeric merit estimate for EVERY stream, for display — NOT used to pick best_stream,
-    # and not directly comparable across streams (different subject mix/baseline per stream)
-    all_results = {s: predict_merit_for_stream(short_scores, s) for s in STREAMS}
+def recommend(scores: dict) -> dict:
+    all_results = {s: predict_merit_for_stream(scores, s) for s in STREAMS}
+    best_stream = max(all_results, key=all_results.get)
 
     return {
         "results": all_results,
-        "eligible_streams": eligible,
         "best_stream": best_stream,
         "best_score": all_results[best_stream],
-        "stem_fit": round(stem_z, 2),
-        "humanities_fit": round(hum_z, 2),
-        "forced_by_rule": len(eligible) < len(STREAMS),  # True if some stream(s) got gated out
     }
 
 
@@ -209,7 +156,7 @@ def _score_band(mark: float) -> str:
     return "weak"
 
 
-def generate_ai_comment(scores: dict, best_stream: str, results: dict, forced_by_rule: bool) -> str:
+def generate_ai_comment(scores: dict, best_stream: str, results: dict) -> str:
     """
     Calls Groq (Llama 3.3 / gpt-oss) to turn the recommendation into a warm,
     personalized comment explaining WHY this stream suits the student — based
@@ -244,8 +191,7 @@ def generate_ai_comment(scores: dict, best_stream: str, results: dict, forced_by
         f"(this band is the true quality of the mark, not just its rank): {top_subjects_text}\n"
         f"Their overall performance band: {overall_band}\n"
         f"The recommended stream is: {best_stream}\n"
-        f"Estimated merit scores per stream (for reference only): {results}\n"
-        f"{'Some streams were not eligible for this student based on their Math/Science marks.' if forced_by_rule else ''}\n\n"
+        f"Estimated merit scores per stream (for reference only): {results}\n\n"
         "Write ONE short sentence (max 30 words) explaining why this stream suits them, "
         "referencing their actual strongest subject(s) by name.\n"
         "STRICT RULES:\n"
@@ -325,20 +271,15 @@ def home():
 
 @app.get("/model-info")
 def model_info():
-    """Returns metadata about the trained model: CV metrics, held-out
-    recommendation accuracy, and the eligibility gates in use."""
-    if not bundle:
+    """Returns metadata about the loaded model bundle."""
+    if model_load_error is not None:
         raise HTTPException(status_code=503, detail="Model metadata not available.")
 
     return {
-        "approach": "gate (eligibility) -> subject-fit (which stream) -> shared merit model (informational score)",
-        "feature_columns": feature_cols,
-        "gates": gates,
-        "merit_model_cv_mae": bundle.get("cv_mae"),
-        "merit_model_cv_r2": bundle.get("cv_r2"),
-        "holdout_recommendation_accuracy": bundle.get("holdout_recommendation_accuracy"),
-        "n_train": bundle.get("n_train"),
-        "n_test": bundle.get("n_test"),
+        "approach": "one independent merit-regression model per stream; the stream with the "
+                    "highest predicted merit score is recommended",
+        "feature_columns": F3_COLS,
+        "streams": list(stream_models.keys()),
     }
 
 
@@ -376,37 +317,26 @@ def predict(data: ScoreInput):
     scores = data.dict()  # e.g. {"F3_BM": 75, "F3_BI": 80, ...}
 
     try:
-        short_scores = {F3_TO_SHORT[k]: v for k, v in scores.items()}
-    except Exception as e:
-        logger.error("Failed to map input fields: %s", e)
-        raise HTTPException(status_code=400, detail="Invalid input data.")
-
-    try:
-        rec = recommend(short_scores)
+        rec = recommend(scores)
     except Exception as e:
         logger.error("Recommendation failed: %s", e)
         raise HTTPException(status_code=500, detail="Prediction failed.")
 
     total_score = round(sum(scores.values()), 2)
 
-    ai_reason = generate_ai_comment(scores, rec["best_stream"], rec["results"], rec["forced_by_rule"])
+    ai_reason = generate_ai_comment(scores, rec["best_stream"], rec["results"])
 
     logger.info(
-        "Predict request | total=%s | results=%s | eligible=%s | best=%s",
-        total_score, rec["results"], rec["eligible_streams"], rec["best_stream"],
+        "Predict request | total=%s | results=%s | best=%s",
+        total_score, rec["results"], rec["best_stream"],
     )
 
     # Response shape kept identical to the old API (results, best_stream, best_score,
     # total_input_score, recommendation_reason) so the existing frontend needs NO changes.
-    # A few extra fields are added (eligible_streams, stem_fit, humanities_fit) — the
-    # frontend can simply ignore them if it doesn't read them.
     return {
         "results": rec["results"],
         "best_stream": rec["best_stream"],
         "best_score": rec["best_score"],
         "total_input_score": total_score,
         "recommendation_reason": ai_reason,
-        "eligible_streams": rec["eligible_streams"],
-        "stem_fit": rec["stem_fit"],
-        "humanities_fit": rec["humanities_fit"],
     }
