@@ -304,7 +304,7 @@ def generate_ai_comment(scores: dict, best_stream: str, results: dict, forced_ar
 # --------------------------------------------------
 # Routes
 # --------------------------------------------------
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {
         "message": "SPM Stream Predictor API is running",
